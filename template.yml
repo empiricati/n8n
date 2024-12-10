@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Template para criação do serviço n8n no mesmo cluster ECS do Appsmith.
+
+Parameters:
+  Idvpc:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC utilizada pelos serviços do ECS
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Primeira subnet utilizada pelos serviços do ECS
+  SubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Segunda subnet utilizada pelos serviços do ECS
+  ApplicationName:
+    Type: String
+    Default: n8n-hml
+  ECSCluster:
+    Type: String
+    Description: Nome do cluster ECS onde o serviço será executado
+  LoadBalancerSecurityGroup:
+    Type: String
+    Description: Security Group do Load Balancer
+  ALBListenerHTTPs:
+    Type: String
+    Description: ARN do listener HTTPs do ALB
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    Description: Senha do banco de dados PostgreSQL
+  DatabaseUsername:
+    Type: String
+    Default: n8n_user
+    Description: Nome de usuário do banco de dados PostgreSQL
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ApplicationName}-logs
+      RetentionInDays: 14
+
+  PostgreSQLSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${ApplicationName} PostgreSQL Security Group
+      VpcId: !Ref Idvpc
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 5432
+        ToPort: 5432
+        SourceSecurityGroupId: !Ref ContainerSecurityGroup
+
+  PostgreSQLDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName: !Sub ${ApplicationName}_db
+      AllocatedStorage: 20
+      DBInstanceClass: db.t3.micro
+      Engine: postgres
+      MasterUsername: !Ref DatabaseUsername
+      MasterUserPassword: !Ref DatabasePassword
+      VPCSecurityGroups:
+      - !Ref PostgreSQLSecurityGroup
+      DBSubnetGroupName: !Ref PostgreSQLDBSubnetGroup
+      PubliclyAccessible: false
+      StorageEncrypted: true
+
+  PostgreSQLDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for PostgreSQL
+      SubnetIds:
+      - !Ref SubnetId
+      - !Ref SubnetId2
+
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ApplicationName}-task
+      NetworkMode: awsvpc
+      Cpu: 1024
+      Memory: 2048
+      ExecutionRoleArn: arn:aws:iam::123456789012:role/ecsTaskExecutionRole # Substituir pelo ARN correto
+      TaskRoleArn: arn:aws:iam::123456789012:role/ecsTaskExecutionRole # Substituir pelo ARN correto
+      RequiresCompatibilities:
+      - FARGATE
+      ContainerDefinitions:
+      - Name: !Sub ${ApplicationName}-container
+        Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ApplicationName}:latest
+        Essential: true
+        PortMappings:
+        - ContainerPort: 5678
+          Protocol: tcp
+        Environment:
+        - Name: DB_TYPE
+          Value: postgresdb
+        - Name: DB_POSTGRESDB_HOST
+          Value: !GetAtt PostgreSQLDB.Endpoint.Address
+        - Name: DB_POSTGRESDB_PORT
+          Value: "5432"
+        - Name: DB_POSTGRESDB_DATABASE
+          Value: !Sub ${ApplicationName}_db
+        - Name: DB_POSTGRESDB_USER
+          Value: !Ref DatabaseUsername
+        - Name: DB_POSTGRESDB_PASSWORD
+          Value: !Ref DatabasePassword
+        - Name: N8N_BASIC_AUTH_ACTIVE
+          Value: "true"
+        - Name: N8N_BASIC_AUTH_USER
+          Value: "admin"
+        - Name: N8N_BASIC_AUTH_PASSWORD
+          Value: "senha-segura"
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref LogGroup
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: ecs
+            awslogs-create-group: true
+        HealthCheck:
+          Command:
+          - CMD-SHELL
+          - curl -f http://localhost:5678/ || exit 1
+          Interval: 10
+          Timeout: 5
+          StartPeriod: 160
+          Retries: 3
+
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+          - !Ref SubnetId
+          - !Ref SubnetId2
+          SecurityGroups:
+          - !Ref ContainerSecurityGroup
+      LoadBalancers:
+      - ContainerName: !Sub ${ApplicationName}-container
+        ContainerPort: 5678
+        TargetGroupArn: !Ref TargetGroup
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckTimeoutSeconds: 10
+      UnhealthyThresholdCount: 3
+      HealthyThresholdCount: 2
+      Name: !Sub ${ApplicationName}-tg
+      Port: 5678
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref Idvpc
+
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${ApplicationName} Container Security Group
+      VpcId: !Ref Idvpc
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 5678
+        ToPort: 5678
+        SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+
+  ListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListenerHTTPs
+      Conditions:
+      - Field: path-pattern
+        Values:
+        - /n8n/*
+      Actions:
+      - Type: forward
+        TargetGroupArn: !Ref TargetGroup
+      Priority: 3
+
+Outputs:
+  N8nTaskDefinition:
+    Description: n8n Task Definition
+    Value: !Ref ECSTaskDefinition
+  N8nService:
+    Description: n8n ECS Service
+    Value: !Ref ECSService
+  PostgreSQLEndpoint:
+    Description: Endpoint do banco de dados PostgreSQL
+    Value: !GetAtt PostgreSQLDB.Endpoint.Address

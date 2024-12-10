@@ -1,0 +1,23 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      docker: 20
+    commands:
+    - echo "Instalando dependências"
+  pre_build:
+    commands:
+    - echo "Login no Amazon ECR"
+    - $(aws ecr get-login-password --region $AWS_DEFAULT_REGION) | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
+  build:
+    commands:
+    - echo "Construindo imagem Docker"
+    - docker build -t n8n .
+    - docker tag n8n:latest ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/n8n:latest
+  post_build:
+    commands:
+    - echo "Enviando imagem para o ECR"
+    - docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/n8n:latest
+    - echo "Forçando atualização do serviço ECS"
+    - aws ecs update-service --cluster <ECSCluster> --service <N8nService> --force-new-deployment
